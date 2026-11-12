@@ -746,6 +746,17 @@ impl BattlePool {
 
 
 
+    /// porygonz: closed team sheets for these battles (the opponent's unrevealed sets hidden), even in a
+    /// format whose rules show them.
+    fn set_closed_sheets(&mut self, indices: Vec<usize>, closed: bool) -> PyResult<()> {
+        for &i in &indices {
+            if let Some(slot) = self.slots.get_mut(i).ok_or_else(|| err(format!("pool index {i} out of range")))?.as_mut() {
+                slot.ctx.closed_sheets = closed;
+            }
+        }
+        Ok(())
+    }
+
     fn set_open_sheets(&mut self, indices: Vec<usize>, open: bool) -> PyResult<()> {
         for &i in &indices {
             if let Some(slot) = self.slots.get_mut(i).ok_or_else(|| err(format!("pool index {i} out of range")))?.as_mut() {
@@ -773,7 +784,7 @@ impl BattlePool {
         let rules = slot.battle.rules();
         let (sheet, brought) = (&slot.ctx.sheets[side as usize], &slot.ctx.brought[side as usize]);
         let s = &slot.battle.sides[side as usize];
-        let open = rules.open_team_sheets || slot.ctx.open_sheets;
+        let open = slot.ctx.sheets_open(rules);
         let mut out = Vec::with_capacity(ROSTER_SIZE);
         for (r, sm) in sheet.mons.iter().enumerate() {
             if sm.species == 0 {
@@ -832,7 +843,7 @@ impl BattlePool {
             let team = *self.teams.get(tid).ok_or_else(|| err(format!("unknown team id {tid}")))?;
             let Some(slot) = self.slots.get_mut(i).ok_or_else(|| err(format!("pool index {i} out of range")))?.as_mut() else { continue };
             let rules = slot.battle.rules();
-            let open = rules.open_team_sheets || slot.ctx.open_sheets;
+            let open = slot.ctx.sheets_open(rules);
             let (sheet, brought) = (slot.ctx.sheets[side as usize], slot.ctx.brought[side as usize]);
             if (0..ROSTER_SIZE).any(|r| sheet.mons[r].species != team.sheet.mons[r].species) {
                 return Err(err(format!("set_sets: team {tid}'s species differ from battle {i}'s sheet")));
@@ -931,6 +942,7 @@ impl BattlePool {
             ctx.brought[side] = b;
         }
         ctx.open_sheets = opt::<bool>(snapshot, "open_sheets")?.unwrap_or(false);
+        ctx.closed_sheets = opt::<bool>(snapshot, "closed_sheets")?.unwrap_or(false);
         let mut battle = Battle {
             sides: [sides[0], sides[1]],
             field: engine_core::field::Field::default(),

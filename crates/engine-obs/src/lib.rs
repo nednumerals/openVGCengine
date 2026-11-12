@@ -197,9 +197,16 @@ pub struct ObsContext {
 
 
     pub open_sheets: bool,
+    /// porygonz: hide the opponent's unrevealed sets even when the format's rules show sheets
+    /// (closed-sheet / Bo1 play of an open-sheet format such as Champions)
+    pub closed_sheets: bool,
 }
 
 impl ObsContext {
+    /// Whether this battle's team sheets are visible to the opponent.
+    pub fn sheets_open(&self, rules: &engine_core::rules::Rules) -> bool {
+        (rules.open_team_sheets && !self.closed_sheets) || self.open_sheets
+    }
 
 
     pub fn from_battle(battle: &Battle) -> ObsContext {
@@ -211,7 +218,7 @@ impl ObsContext {
             }
             sheet
         };
-        ObsContext { sheets: [sheet(0), sheet(1)], brought: [[0, 1, 2, 3]; 2], open_sheets: false }
+        ObsContext { sheets: [sheet(0), sheet(1)], brought: [[0, 1, 2, 3]; 2], open_sheets: false, closed_sheets: false }
     }
 }
 
@@ -412,7 +419,7 @@ fn encode_mon(battle: &Battle, ctx: &ObsContext, me: u8, side: u8, r: usize, ids
     f[mf::IS_MINE] = mine as u8 as f32;
     let rules = battle.rules();
 
-    let open = rules.open_team_sheets || ctx.open_sheets;
+    let open = ctx.sheets_open(rules);
     let sheet_known = mine || open;
     let live = battle_index(ctx, side, r)
         .map(|i| (i, &battle.sides[side as usize].mons[i]))
