@@ -35,6 +35,8 @@ struct Team {
 struct Slot {
     battle: Battle,
     ctx: ObsContext,
+    /// porygonz: the team id each side is shown for its opponent (guessed sheets, `set_view_sheets`)
+    views: [Option<usize>; 2],
 
     failed: bool,
 }
@@ -294,7 +296,7 @@ impl BattlePool {
                 ctx.sheets[side] = t.sheet;
                 ctx.brought[side] = b;
             }
-            self.slots[i] = Some(Slot { battle: alloc_count::counted(3, || team::new_battle_in(format, [sides[0], sides[1]], seeds[k])), ctx, failed: false });
+            self.slots[i] = Some(Slot { battle: alloc_count::counted(3, || team::new_battle_in(format, [sides[0], sides[1]], seeds[k])), ctx, views: [None, None], failed: false });
         }
         Ok(())
     }
@@ -320,6 +322,7 @@ impl BattlePool {
         let mon_features = slice_mut(&mut mon_features, n * ms, "mon_features")?;
         let history = slice_mut(&mut history, n * hs, "history")?;
         let slots = &self.slots;
+        let teams = &self.teams;
         py.detach(|| {
             field
                 .par_chunks_mut(fs)
@@ -328,7 +331,16 @@ impl BattlePool {
                 .zip(history.par_chunks_mut(hs))
                 .zip(slots.par_iter())
                 .for_each(|((((f, ids), feats), hist), slot)| match slot {
-                    Some(s) => alloc_count::counted(1, || engine_obs::encode(&s.battle, &s.ctx, side, engine_obs::ObsBuffers { field: f, mon_ids: ids, mon_features: feats, history: hist })),
+                    Some(s) => alloc_count::counted(1, || {
+                        let bufs = engine_obs::ObsBuffers { field: f, mon_ids: ids, mon_features: feats, history: hist };
+                        match s.views[side as usize].and_then(|tid| teams.get(tid)) {
+                            Some(view) => {
+                                let (b, c) = guess_view(&s.battle, &s.ctx, side, view);
+                                engine_obs::encode(&b, &c, side, bufs)
+                            }
+                            None => engine_obs::encode(&s.battle, &s.ctx, side, bufs),
+                        }
+                    }),
                     None => {
                         f.fill(0.0);
                         ids.fill(0);
@@ -757,6 +769,31 @@ impl BattlePool {
         Ok(())
     }
 
+    /// porygonz: show `side` a guessed sheet for its opponent in these battles - the team `teams[k]` (same
+    /// species in the same order as the opponent's sheet; None clears it). The observation is then that of
+    /// open sheets where everything the opponent hasn't revealed comes from the guess (`guess_view`): what
+    /// the advisor shows the network in Bo1. Cleared when a battle is reset.
+    fn set_view_sheets(&mut self, indices: Vec<usize>, side: u8, teams: Vec<Option<usize>>) -> PyResult<()> {
+        if indices.len() != teams.len() || side > 1 {
+            return Err(err("set_view_sheets: indices and teams must have the same length, side 0 or 1"));
+        }
+        for (&i, &tid) in indices.iter().zip(&teams) {
+            let opp = (1 - side) as usize;
+            if let Some(tid) = tid {
+                let team = self.teams.get(tid).ok_or_else(|| err(format!("unknown team id {tid}")))?;
+                if let Some(Some(slot)) = self.slots.get(i) {
+                    if (0..ROSTER_SIZE).any(|r| slot.ctx.sheets[opp].mons[r].species != team.sheet.mons[r].species) {
+                        return Err(err(format!("set_view_sheets: team {tid}'s species differ from battle {i}'s opponent")));
+                    }
+                }
+            }
+            if let Some(slot) = self.slots.get_mut(i).ok_or_else(|| err(format!("pool index {i} out of range")))?.as_mut() {
+                slot.views[side as usize] = tid;
+            }
+        }
+        Ok(())
+    }
+
     fn set_open_sheets(&mut self, indices: Vec<usize>, open: bool) -> PyResult<()> {
         for &i in &indices {
             if let Some(slot) = self.slots.get_mut(i).ok_or_else(|| err(format!("pool index {i} out of range")))?.as_mut() {
@@ -1061,7 +1098,7 @@ impl BattlePool {
         if battle.pending != Pending::Turn {
             return Err(err(format!("load_state: the snapshot isn't at a turn decision ({:?})", battle.pending)));
         }
-        self.slots[index] = Some(Slot { battle, ctx, failed: false });
+        self.slots[index] = Some(Slot { battle, ctx, views: [None, None], failed: false });
         Ok(())
     }
 
@@ -1206,6 +1243,72 @@ fn keep_shown_hp(rules: &engine_core::rules::Rules, m: &mut engine_core::mon::Mo
 }
 
 
+
+/// porygonz: abilities Showdown announces when their holder enters the battle (`|-ability|` or `[from]
+/// ability:` on switch-in) - once such a Pokemon has been seen, its ability is known.
+fn announces_on_entry(a: u16) -> bool {
+    use engine_data::abilities_table::ability_ids::*;
+    matches!(a, INTIMIDATE | DROUGHT | DRIZZLE | SANDSTREAM | SNOWWARNING | ORICHALCUMPULSE | HADRONENGINE
+        | ELECTRICSURGE | GRASSYSURGE | MISTYSURGE | PSYCHICSURGE | PRESSURE | UNNERVE | MOLDBREAKER | TERAVOLT
+        | TURBOBLAZE | AIRLOCK | CLOUDNINE | NEUTRALIZINGGAS | FRISK | ANTICIPATION | FOREWARN | TRACE | COMATOSE
+        | DARKAURA | FAIRYAURA | AURABREAK | ASONEGLASTRIER | ASONESPECTRIER | SUPERSWEETSYRUP | EMBODYASPECTTEAL
+        | EMBODYASPECTHEARTHFLAME | EMBODYASPECTWELLSPRING | EMBODYASPECTCORNERSTONE | COSTAR | DOWNLOAD
+        | INTREPIDSWORD | DAUNTLESSSHIELD | SCREENCLEANER | CURIOUSMEDICINE | VESSELOFRUIN | SWORDOFRUIN
+        | TABLETSOFRUIN | BEADSOFRUIN | DESOLATELAND | PRIMORDIALSEA | DELTASTREAM | SLOWSTART | ZEROTOHERO)
+}
+
+/// porygonz: the battle as `side` believes it to be when shown `view` as its opponent's sheet - the
+/// opponent's revealed moves, consumed / changed / visible items (Mega Stones, type-changing items) and
+/// announced or Mega abilities stay; everything else comes from the guess - encoded as open sheets.
+/// Not tracked (the guess stays): items revealed only by a message (Life Orb recoil, Leftovers) and
+/// abilities revealed by triggering (Rough Skin, Sturdy...).
+fn guess_view(battle: &Battle, ctx: &ObsContext, side: u8, view: &Team) -> (Battle, ObsContext) {
+    use engine_core::mon::mon_flags;
+    let mut b = *battle;
+    let mut c = *ctx;
+    let opp = (1 - side) as usize;
+    let rules = b.rules();
+    let (sheet, brought) = (c.sheets[opp], c.brought[opp]);
+    for (k, m) in b.sides[opp].mons.iter_mut().enumerate() {
+        let r = brought[k] as usize;
+        let (g, sm) = (&view.sets[r], &sheet.mons[r]);
+        if m.flags.has(mon_flags::TRANSFORMED) || m.illusion.is_some() {
+            continue;
+        }
+        let kept: Vec<u16> = (0..4).filter(|&s| m.moves_revealed & (1 << s) != 0).map(|s| m.moves[s]).collect();
+        let mut fill = g.moves.iter().copied().filter(|&x| x != 0 && !kept.contains(&x));
+        for s in 0..4 {
+            if m.moves_revealed & (1 << s) == 0 {
+                let x = fill.next().unwrap_or(0);
+                m.moves[s] = x;
+                m.pp[s] = if x == 0 { 0 } else { rules.max_pp(x) };
+            }
+        }
+        if m.item == sm.item && !item_shows(&rules, m) {
+            m.item = g.item;
+            // a choice lock is what the guessed item implies (the real one would give the item away)
+            if engine_core::turn::is_choice_item(m.item) && m.last_move != 0 {
+                m.volatiles.set(engine_core::mon::volatile_flags::CHOICE_LOCKED);
+            } else {
+                m.volatiles.clear(engine_core::mon::volatile_flags::CHOICE_LOCKED);
+            }
+        }
+        let sheet_ability = if sm.ability == 0 { rules.species_data(sm.species).abilities[0] } else { sm.ability };
+        let known = m.mega.active || m.ability != sheet_ability
+            || (m.flags.has(mon_flags::REVEALED) && announces_on_entry(m.ability));
+        if !known {
+            let new = if g.ability == 0 { rules.species_data(g.species).abilities[0] } else { g.ability };
+            m.ability = new;
+            if m.base_ability != engine_core::ids::NONE_ID {
+                m.base_ability = new;
+            }
+        }
+    }
+    c.sheets[opp] = view.sheet;
+    c.closed_sheets = false;
+    c.open_sheets = true;
+    (b, c)
+}
 
 fn item_shows(rules: &engine_core::rules::Rules, m: &engine_core::mon::Mon) -> bool {
     use engine_data::species_table::species_ids::{ZACIANCROWNED, ZAMAZENTACROWNED};
